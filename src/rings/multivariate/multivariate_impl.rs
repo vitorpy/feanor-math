@@ -198,12 +198,11 @@ impl<R, A> MultivariatePolyRingImpl<R, A>
     /// The can represent all monomials up to the given degree, and will panic should an operation
     /// produce a monomial that exceeds this degree. 
     /// 
-    /// Furthermore, `max_multiplication_table = (d1, d2)` configures for which monomials a multiplication 
+    /// Furthermore, `max_multiplication_table = (d1, d2)` configures for which monomials a multiplication
     /// table is precomputed. In particular, a multiplication table is precomputed for all products where
     /// one summand has degree `<= d2` and the other summand has degree `<= d1`. Note that `d1 <= d2` is
     /// required.
-    /// 
-    #[stability::unstable(feature = "enable")]
+    ///
     pub fn new_with_mult_table(base_ring: R, variable_count: usize, max_supported_deg: Exponent, max_multiplication_table: (Exponent, Exponent), allocator: A) -> Self {
         assert!(variable_count >= 1);
         assert!(max_multiplication_table.0 <= max_multiplication_table.1);
@@ -241,7 +240,6 @@ impl<R, A> MultivariatePolyRingImplBase<R, A>
     where R: RingStore,
         A: Clone + Allocator + Send
 {
-    #[stability::unstable(feature = "enable")]
     pub fn allocator(&self) -> &A {
         &self.allocator
     }
