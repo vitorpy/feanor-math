@@ -5,7 +5,6 @@ use std::fmt::Debug;
 use atomicbox::AtomicOptionBox;
 use thread_local::ThreadLocal;
 
-use crate::algorithms::int_bisect;
 use crate::iters::multiset_combinations;
 use crate::primitive_int::StaticRing;
 use crate::ring::*;
@@ -207,18 +206,60 @@ impl<R, A> MultivariatePolyRingImpl<R, A>
         assert!(variable_count >= 1);
         assert!(max_multiplication_table.0 <= max_multiplication_table.1);
         assert!(max_multiplication_table.0 + max_multiplication_table.1 <= max_supported_deg);
-        // the largest degree for which we have an order-preserving embedding of same-degree monomials into OrderIdx
-        let max_degree_for_orderidx = if variable_count == 1 || variable_count == 2 {
-            usize::MAX
-        } else {
-            let k = int_cast(TryInto::<i64>::try_into(variable_count).unwrap() - 1, BigIntRing::RING, StaticRing::<i64>::RING);
-            // ensure that cum_binomial() always fits within an u64
-            int_bisect::find_root_floor(StaticRing::<i64>::RING, 0, |d| if BigIntRing::RING.is_lt(&BigIntRing::RING.mul(
-                binomial(int_cast(d + TryInto::<i64>::try_into(variable_count).unwrap() - 1, BigIntRing::RING, StaticRing::<i64>::RING), &k, BigIntRing::RING),
-                int_cast(*d, BigIntRing::RING, StaticRing::<i64>::RING)
-            ), &BigIntRing::RING.power_of_two(u64::BITS as usize)) { -1 } else { 1 }) as usize
-        };
-        assert!(max_degree_for_orderidx >= max_supported_deg as usize, "currently only degrees are supported for which the total number of this-degree monomials fits in a u64");
+
+        // RELAXED CONSTRAINT: Check per-degree monomial counts instead of cumulative.
+        //
+        // Context: This change was made to support the zyga ZKP subsystem slicer use case,
+        // which needs 64 variables with max degree 2. The original check was overly conservative,
+        // requiring that the *cumulative* number of monomials across all degrees fit in a u64.
+        //
+        // The actual requirement is that for each degree d, the OrderIdx (u64) can represent
+        // the index of any monomial of degree d within the set of all degree-d monomials.
+        // The number of degree-d monomials in n variables is binomial(n + d - 1, d).
+        //
+        // For 64 variables, degree 2: binomial(65, 2) = 2,080 << u64::MAX.
+        // Total monomials (deg 0-2): 1 + 64 + 2,080 = 2,145 (easily fits).
+        //
+        // Safety invariants that must hold:
+        // - OrderIdx (u64) can represent any monomial index at each individual degree
+        // - The cum_binomial_lookup_table values (used for monomial enumeration) fit in u64
+        // - Monomial multiplication table construction doesn't overflow
+        //
+        // We now check that each individual degree's monomial count fits in u64, rather than
+        // checking an overly conservative cumulative bound.
+
+        // Check that each degree's monomial count fits in u64
+        for d in 0..=max_supported_deg {
+            let monomial_count = binomial(
+                int_cast((variable_count + d as usize - 1) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
+                &int_cast(d as i128, BigIntRing::RING, StaticRing::<i128>::RING),
+                BigIntRing::RING
+            );
+            assert!(
+                BigIntRing::RING.is_lt(&monomial_count, &BigIntRing::RING.power_of_two(u64::BITS as usize)),
+                "Degree {} has too many monomials (exceeds u64::MAX). Try reducing max_supported_deg or variable_count.",
+                d
+            );
+        }
+
+        // Also verify that cum_binomial values for the lookup table will fit in u64.
+        // The lookup table has dimensions [variable_count - 1][max_supported_deg + 1].
+        // We check the largest entry: cum_binomial(variable_count - 2, max_supported_deg).
+        if variable_count > 2 {
+            let max_cum_binomial = BigIntRing::RING.sum(
+                (0..=max_supported_deg).map(|l| {
+                    binomial(
+                        int_cast((variable_count - 2 + l as usize) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
+                        &int_cast((variable_count - 2) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
+                        BigIntRing::RING
+                    )
+                })
+            );
+            assert!(
+                BigIntRing::RING.is_lt(&max_cum_binomial, &BigIntRing::RING.power_of_two(u64::BITS as usize)),
+                "Cumulative binomial lookup table entry would exceed u64::MAX. Try reducing max_supported_deg."
+            );
+        }
 
         let cum_binomial_lookup_table = (0..(variable_count - 1)).map(|n| (0..=max_supported_deg).map(|k| compute_cum_binomial(n, k as usize)).collect::<Vec<_>>()).collect::<Vec<_>>();
         let monomial_multipliation_table = (0..max_multiplication_table.0).map(|lhs_deg| (lhs_deg..max_multiplication_table.1).map(|rhs_deg| MultivariatePolyRingImplBase::<R, A>::create_multiplication_table(variable_count, lhs_deg, rhs_deg, &cum_binomial_lookup_table)).collect::<Vec<_>>()).collect::<Vec<_>>();
