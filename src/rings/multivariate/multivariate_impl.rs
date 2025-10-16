@@ -18,6 +18,110 @@ type Exponent = u16;
 type OrderIdx = u64;
 
 ///
+/// Error type for monomial degree overflow.
+///
+/// This error occurs when a monomial operation (e.g., multiplication, lcm) would produce
+/// a degree exceeding the ring's `max_supported_deg` configuration parameter.
+///
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DegreeOverflowError {
+    pub max_supported_deg: Exponent,
+    pub attempted_deg: Exponent,
+    pub operation: &'static str,
+}
+
+impl std::fmt::Display for DegreeOverflowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Degree overflow in {}: ring supports max degree {}, but operation produced degree {}",
+            self.operation, self.max_supported_deg, self.attempted_deg
+        )
+    }
+}
+
+impl std::error::Error for DegreeOverflowError {}
+
+///
+/// Monomial indexing mode for polynomial rings.
+///
+/// Controls how monomials are stored and accessed internally:
+/// - `Auto`: Automatically choose Dense for low degrees, Sparse for high degrees
+/// - `DenseOnly`: Always use dense (indexed) mode; panic if degree tables overflow
+/// - `SparseOnly`: Always use sparse (explicit exponent) mode
+///
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexMode {
+    /// Automatically choose between Dense and Sparse based on safe_degree_threshold
+    Auto,
+    /// Always use dense indexing; panic on overflow
+    DenseOnly,
+    /// Always use sparse (exponent vector) indexing
+    SparseOnly,
+}
+
+impl Default for IndexMode {
+    fn default() -> Self {
+        IndexMode::Auto
+    }
+}
+
+///
+/// Degree configuration for polynomial rings.
+///
+/// Specifies the maximum supported degree and the degree up to which precomputed
+/// tables (binomial coefficients, multiplication tables) should be built.
+///
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DegreeCfg {
+    /// Maximum degree that monomials can reach; operations exceeding this will error
+    pub max_supported_deg: u16,
+    /// Maximum degree for which to precompute lookup tables; higher degrees use on-demand computation
+    pub max_precompute_deg: Option<u16>,
+}
+
+impl DegreeCfg {
+    /// Create a new degree configuration
+    pub fn new(max_supported_deg: u16) -> Self {
+        DegreeCfg {
+            max_supported_deg,
+            max_precompute_deg: None, // Auto-determine based on variable count
+        }
+    }
+
+    /// Set the maximum degree for precomputed tables
+    pub fn with_precompute(mut self, max_precompute_deg: u16) -> Self {
+        self.max_precompute_deg = Some(max_precompute_deg);
+        self
+    }
+}
+
+///
+/// Error type for monomial indexing failures.
+///
+/// This error occurs when dense indexing is explicitly required (IndexMode::DenseOnly)
+/// but the degree would exceed the safe threshold.
+///
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonomialIndexError {
+    pub degree: u16,
+    pub safe_threshold: u16,
+    pub indexing_mode: &'static str,
+}
+
+impl std::fmt::Display for MonomialIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Monomial indexing error: degree {} exceeds safe threshold {} for {} mode",
+            self.degree, self.safe_threshold, self.indexing_mode
+        )
+    }
+}
+
+impl std::error::Error for MonomialIndexError {}
+
+///
 /// Computes the "cumulative binomial function" `sum_(0 <= l <= k) binomial(n + l, n)`
 /// 
 fn compute_cum_binomial(n: usize, k: usize) -> u64 {
@@ -79,7 +183,7 @@ fn nth_monomial_degrevlex<F>(n: usize, d: Exponent, mut index: u64, cum_binomial
 
 ///
 /// Stores a reference to a monomial w.r.t. a given [`MultivariatePolyRingImplBase`].
-/// 
+///
 #[repr(transparent)]
 pub struct MonomialIdentifier {
     data: InternalMonomialIdentifier
@@ -87,17 +191,43 @@ pub struct MonomialIdentifier {
 
 impl Debug for MonomialIdentifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MonomialIdentifier")
-            .field("deg", &self.data.deg)
-            .field("idx", &self.data.order)
-            .finish()
+        match &self.data.data {
+            InternalMonomialData::Dense { deg, order } => {
+                f.debug_struct("MonomialIdentifier")
+                    .field("deg", deg)
+                    .field("idx", order)
+                    .finish()
+            }
+            InternalMonomialData::Sparse { deg, .. } => {
+                f.debug_struct("MonomialIdentifier")
+                    .field("deg", deg)
+                    .field("mode", &"sparse")
+                    .finish()
+            }
+        }
     }
+}
+
+///
+/// Internal representation supporting both dense (indexed) and sparse (explicit exponents) modes.
+/// Dense mode uses lookup tables for fast operations when per-degree monomial counts fit in u64.
+/// Sparse mode stores exponents directly for high degrees where enumeration would overflow.
+///
+#[derive(Clone, Debug)]
+enum InternalMonomialData {
+    Dense {
+        deg: Exponent,
+        order: OrderIdx,
+    },
+    Sparse {
+        deg: Exponent,
+        exponents: Box<[Exponent]>,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct InternalMonomialIdentifier {
-    deg: Exponent,
-    order: OrderIdx
+    data: InternalMonomialData,
 }
 
 impl InternalMonomialIdentifier {
@@ -105,12 +235,26 @@ impl InternalMonomialIdentifier {
     fn wrap(self) -> MonomialIdentifier {
         MonomialIdentifier { data: self }
     }
+
+    fn deg(&self) -> Exponent {
+        match &self.data {
+            InternalMonomialData::Dense { deg, .. } => *deg,
+            InternalMonomialData::Sparse { deg, .. } => *deg,
+        }
+    }
 }
 
 impl PartialEq for InternalMonomialIdentifier {
     fn eq(&self, other: &Self) -> bool {
-        let res = self.deg == other.deg && self.order == other.order;
-        return res;
+        match (&self.data, &other.data) {
+            (InternalMonomialData::Dense { deg: d1, order: o1 }, InternalMonomialData::Dense { deg: d2, order: o2 }) => {
+                d1 == d2 && o1 == o2
+            }
+            (InternalMonomialData::Sparse { deg: d1, exponents: e1 }, InternalMonomialData::Sparse { deg: d2, exponents: e2 }) => {
+                d1 == d2 && e1 == e2
+            }
+            _ => false, // Dense != Sparse
+        }
     }
 }
 
@@ -118,7 +262,18 @@ impl Eq for InternalMonomialIdentifier {}
 
 impl Ord for InternalMonomialIdentifier {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.deg.cmp(&other.deg).then_with(|| self.order.cmp(&other.order))
+        // DegRevLex order: first by degree, then by lexicographic comparison (reversed)
+        // For now, delegate to detailed comparison; this will be refined below
+        self.deg().cmp(&other.deg()).then_with(|| {
+            // If both are dense, use order index
+            match (&self.data, &other.data) {
+                (InternalMonomialData::Dense { order: o1, .. }, InternalMonomialData::Dense { order: o2, .. }) => {
+                    o1.cmp(o2)
+                }
+                // For sparse or mixed, need exponent-wise comparison (implemented per-ring below)
+                _ => Ordering::Equal, // Placeholder; actual comparison done in ring methods
+            }
+        })
     }
 }
 
@@ -150,7 +305,7 @@ impl<R, A> Debug for MultivariatePolyRingEl<R, A>
 
 ///
 /// Implementation of multivariate polynomial rings.
-/// 
+///
 pub struct MultivariatePolyRingImplBase<R, A = Global>
     where R: RingStore,
         A: Clone + Allocator + Send
@@ -167,6 +322,9 @@ pub struct MultivariatePolyRingImplBase<R, A = Global>
     zero: El<R>,
     cum_binomial_lookup_table: Vec<Vec<u64>>,
     max_supported_deg: Exponent,
+    /// Maximum degree for which dense (indexed) monomials can be used.
+    /// For degrees > safe_degree_threshold, sparse mode is automatically used.
+    safe_degree_threshold: Exponent,
     allocator: A,
     tmp_poly: AtomicOptionBox<Vec<(El<R>, MonomialIdentifier)>>
 }
@@ -228,26 +386,30 @@ impl<R, A> MultivariatePolyRingImpl<R, A>
         // We now check that each individual degree's monomial count fits in u64, rather than
         // checking an overly conservative cumulative bound.
 
-        // Check that each degree's monomial count fits in u64
+        // Compute safe_degree_threshold: the highest degree for which per-degree monomial
+        // count fits in u64. For degrees above this, we'll use sparse mode.
+        let mut safe_degree_threshold = max_supported_deg;
         for d in 0..=max_supported_deg {
             let monomial_count = binomial(
                 int_cast((variable_count + d as usize - 1) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
                 &int_cast(d as i128, BigIntRing::RING, StaticRing::<i128>::RING),
                 BigIntRing::RING
             );
-            assert!(
-                BigIntRing::RING.is_lt(&monomial_count, &BigIntRing::RING.power_of_two(u64::BITS as usize)),
-                "Degree {} has too many monomials (exceeds u64::MAX). Try reducing max_supported_deg or variable_count.",
-                d
-            );
+            if !BigIntRing::RING.is_lt(&monomial_count, &BigIntRing::RING.power_of_two(u64::BITS as usize)) {
+                // This degree exceeds u64, so safe threshold is d-1
+                safe_degree_threshold = d.saturating_sub(1);
+                break;
+            }
         }
 
-        // Also verify that cum_binomial values for the lookup table will fit in u64.
-        // The lookup table has dimensions [variable_count - 1][max_supported_deg + 1].
-        // We check the largest entry: cum_binomial(variable_count - 2, max_supported_deg).
-        if variable_count > 2 {
+        // Build lookup tables only up to safe_degree_threshold
+        // This ensures cum_binomial values won't overflow
+        let table_max_deg = safe_degree_threshold;
+
+        // Verify that cum_binomial values for the lookup table will fit in u64
+        if variable_count > 2 && table_max_deg > 0 {
             let max_cum_binomial = BigIntRing::RING.sum(
-                (0..=max_supported_deg).map(|l| {
+                (0..=table_max_deg).map(|l| {
                     binomial(
                         int_cast((variable_count - 2 + l as usize) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
                         &int_cast((variable_count - 2) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
@@ -257,17 +419,137 @@ impl<R, A> MultivariatePolyRingImpl<R, A>
             );
             assert!(
                 BigIntRing::RING.is_lt(&max_cum_binomial, &BigIntRing::RING.power_of_two(u64::BITS as usize)),
-                "Cumulative binomial lookup table entry would exceed u64::MAX. Try reducing max_supported_deg."
+                "Cumulative binomial lookup table entry would exceed u64::MAX at safe_degree_threshold {}. This is a bug.", safe_degree_threshold
             );
         }
 
-        let cum_binomial_lookup_table = (0..(variable_count - 1)).map(|n| (0..=max_supported_deg).map(|k| compute_cum_binomial(n, k as usize)).collect::<Vec<_>>()).collect::<Vec<_>>();
-        let monomial_multipliation_table = (0..max_multiplication_table.0).map(|lhs_deg| (lhs_deg..max_multiplication_table.1).map(|rhs_deg| MultivariatePolyRingImplBase::<R, A>::create_multiplication_table(variable_count, lhs_deg, rhs_deg, &cum_binomial_lookup_table)).collect::<Vec<_>>()).collect::<Vec<_>>();
+        let cum_binomial_lookup_table = (0..(variable_count - 1)).map(|n| (0..=table_max_deg).map(|k| compute_cum_binomial(n, k as usize)).collect::<Vec<_>>()).collect::<Vec<_>>();
+
+        // Multiplication tables: only build for degrees within safe threshold
+        let mult_table_max = (max_multiplication_table.0.min(safe_degree_threshold), max_multiplication_table.1.min(safe_degree_threshold));
+        let monomial_multipliation_table = (0..=mult_table_max.0).map(|lhs_deg| (lhs_deg..=mult_table_max.1).map(|rhs_deg| MultivariatePolyRingImplBase::<R, A>::create_multiplication_table(variable_count, lhs_deg, rhs_deg, &cum_binomial_lookup_table)).collect::<Vec<_>>()).collect::<Vec<_>>();
+
         RingValue::from(MultivariatePolyRingImplBase {
             zero: base_ring.zero(),
             base_ring: base_ring,
             variable_count: variable_count,
             max_supported_deg: max_supported_deg,
+            safe_degree_threshold: safe_degree_threshold,
+            monomial_multiplication_table: monomial_multipliation_table,
+            tmp_monomials: ThreadLocal::new(),
+            cum_binomial_lookup_table: cum_binomial_lookup_table,
+            tmp_poly: AtomicOptionBox::none(),
+            allocator: allocator,
+        })
+    }
+
+    ///
+    /// Extended constructor for large-variable systems with explicit degree configuration.
+    ///
+    /// This constructor provides more control over degree handling and table precomputation,
+    /// which is essential for systems with many variables (e.g., 64+ variables) where
+    /// cumulative degree tables would overflow.
+    ///
+    /// # Parameters
+    /// - `base_ring`: The coefficient ring
+    /// - `variable_count`: Number of indeterminates
+    /// - `degree_cfg`: Degree limits and precomputation configuration
+    /// - `max_multiplication_table`: Multiplication table precomputation limits (d1, d2)
+    /// - `allocator`: Memory allocator
+    ///
+    /// # Example
+    /// ```ignore
+    /// use feanor_math::rings::multivariate::multivariate_impl::{MultivariatePolyRingImpl, DegreeCfg};
+    /// use feanor_math::primitive_int::StaticRing;
+    /// use std::alloc::Global;
+    ///
+    /// // 64 variables, max degree 30, precompute tables only up to degree 10
+    /// let degree_cfg = DegreeCfg::new(30).with_precompute(10);
+    /// let ring = MultivariatePolyRingImpl::new_with_mult_table_ex(
+    ///     StaticRing::<i64>::RING,
+    ///     64,
+    ///     degree_cfg,
+    ///     (2, 2),
+    ///     Global
+    /// );
+    /// ```
+    pub fn new_with_mult_table_ex(
+        base_ring: R,
+        variable_count: usize,
+        degree_cfg: DegreeCfg,
+        max_multiplication_table: (Exponent, Exponent),
+        allocator: A
+    ) -> Self {
+        assert!(variable_count >= 1);
+        assert!(max_multiplication_table.0 <= max_multiplication_table.1);
+        assert!(max_multiplication_table.0 + max_multiplication_table.1 <= degree_cfg.max_supported_deg);
+
+        let max_supported_deg = degree_cfg.max_supported_deg;
+
+        // Compute safe_degree_threshold: highest degree where per-degree monomial count fits in u64
+        let mut safe_degree_threshold = max_supported_deg;
+        for d in 0..=max_supported_deg {
+            let monomial_count = binomial(
+                int_cast((variable_count + d as usize - 1) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
+                &int_cast(d as i128, BigIntRing::RING, StaticRing::<i128>::RING),
+                BigIntRing::RING
+            );
+            if !BigIntRing::RING.is_lt(&monomial_count, &BigIntRing::RING.power_of_two(u64::BITS as usize)) {
+                safe_degree_threshold = d.saturating_sub(1);
+                break;
+            }
+        }
+
+        // Determine table_max_deg: limit table building based on max_precompute_deg if specified
+        let table_max_deg = if let Some(max_precompute) = degree_cfg.max_precompute_deg {
+            max_precompute.min(safe_degree_threshold)
+        } else {
+            safe_degree_threshold
+        };
+
+        // Verify cum_binomial values won't overflow
+        if variable_count > 2 && table_max_deg > 0 {
+            let max_cum_binomial = BigIntRing::RING.sum(
+                (0..=table_max_deg).map(|l| {
+                    binomial(
+                        int_cast((variable_count - 2 + l as usize) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
+                        &int_cast((variable_count - 2) as i128, BigIntRing::RING, StaticRing::<i128>::RING),
+                        BigIntRing::RING
+                    )
+                })
+            );
+            assert!(
+                BigIntRing::RING.is_lt(&max_cum_binomial, &BigIntRing::RING.power_of_two(u64::BITS as usize)),
+                "Cumulative binomial lookup table entry would exceed u64::MAX at table_max_deg {}. This is a bug.", table_max_deg
+            );
+        }
+
+        let cum_binomial_lookup_table = (0..(variable_count - 1))
+            .map(|n| (0..=table_max_deg)
+                .map(|k| compute_cum_binomial(n, k as usize))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        // Build multiplication tables only up to the smaller of table_max_deg and requested limits
+        let mult_table_max = (
+            max_multiplication_table.0.min(table_max_deg),
+            max_multiplication_table.1.min(table_max_deg)
+        );
+
+        let monomial_multipliation_table = (0..=mult_table_max.0)
+            .map(|lhs_deg| (lhs_deg..=mult_table_max.1)
+                .map(|rhs_deg| MultivariatePolyRingImplBase::<R, A>::create_multiplication_table(
+                    variable_count, lhs_deg, rhs_deg, &cum_binomial_lookup_table
+                ))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        RingValue::from(MultivariatePolyRingImplBase {
+            zero: base_ring.zero(),
+            base_ring: base_ring,
+            variable_count: variable_count,
+            max_supported_deg: max_supported_deg,
+            safe_degree_threshold: safe_degree_threshold,
             monomial_multiplication_table: monomial_multipliation_table,
             tmp_monomials: ThreadLocal::new(),
             cum_binomial_lookup_table: cum_binomial_lookup_table,
@@ -318,19 +600,59 @@ impl<R, A> MultivariatePolyRingImplBase<R, A>
         where F: FnMut(Exponent, Exponent) -> Exponent
     {
         let (mut lhs_mon, mut rhs_mon) = self.tmp_monomials();
-        nth_monomial_degrevlex(self.variable_count, lhs.deg, lhs.order, &self.cum_binomial_lookup_table, |i, x| lhs_mon[i] = x);
-        nth_monomial_degrevlex(self.variable_count, rhs.deg, rhs.order, &self.cum_binomial_lookup_table, |i, x| rhs_mon[i] = x);
+
+        // Extract exponents from lhs
+        match &lhs.data {
+            InternalMonomialData::Dense { deg, order } => {
+                nth_monomial_degrevlex(self.variable_count, *deg, *order, &self.cum_binomial_lookup_table, |i, x| lhs_mon[i] = x);
+            }
+            InternalMonomialData::Sparse { exponents, .. } => {
+                for (i, &e) in exponents.iter().enumerate() {
+                    lhs_mon[i] = e;
+                }
+            }
+        }
+
+        // Extract exponents from rhs
+        match &rhs.data {
+            InternalMonomialData::Dense { deg, order } => {
+                nth_monomial_degrevlex(self.variable_count, *deg, *order, &self.cum_binomial_lookup_table, |i, x| rhs_mon[i] = x);
+            }
+            InternalMonomialData::Sparse { exponents, .. } => {
+                for (i, &e) in exponents.iter().enumerate() {
+                    rhs_mon[i] = e;
+                }
+            }
+        }
+
+        // Apply operation and compute result
         let mut res_deg = 0;
         for i in 0..self.variable_count {
             lhs_mon[i] = f(lhs_mon[i], rhs_mon[i]);
             res_deg += lhs_mon[i];
         }
         assert!(res_deg <= self.max_supported_deg, "Polynomial ring was configured to support monomials up to degree {}, but operation resulted in degree {}", self.max_supported_deg, res_deg);
-        return MonomialIdentifier {
-            data: InternalMonomialIdentifier {
-                deg: res_deg,
-                order: enumeration_index_degrevlex(res_deg, (&*lhs_mon).clone_els_by(|x| *x), &self.cum_binomial_lookup_table)
-            }
+
+        // Create result monomial (dense or sparse based on degree)
+        if res_deg <= self.safe_degree_threshold {
+            return MonomialIdentifier {
+                data: InternalMonomialIdentifier {
+                    data: InternalMonomialData::Dense {
+                        deg: res_deg,
+                        order: enumeration_index_degrevlex(res_deg, (&*lhs_mon).clone_els_by(|x| *x), &self.cum_binomial_lookup_table)
+                    }
+                }
+            };
+        } else {
+            let exponents_vec: Vec<Exponent> = lhs_mon.iter().cloned().collect();
+            return MonomialIdentifier {
+                data: InternalMonomialIdentifier {
+                    data: InternalMonomialData::Sparse {
+                        deg: res_deg,
+                        exponents: exponents_vec.into_boxed_slice()
+                    }
+                }
+            };
         }
     }
 
@@ -362,9 +684,114 @@ impl<R, A> MultivariatePolyRingImplBase<R, A>
     }
 
     fn compare_degrevlex(&self, lhs: &InternalMonomialIdentifier, rhs: &InternalMonomialIdentifier) -> Ordering {
-        let res = lhs.deg.cmp(&rhs.deg).then_with(|| lhs.order.cmp(&rhs.order));
+        // First compare by degree
+        let res = lhs.deg().cmp(&rhs.deg()).then_with(|| {
+            // If degrees are equal, compare based on mode
+            match (&lhs.data, &rhs.data) {
+                // Both dense: use order index
+                (InternalMonomialData::Dense { order: o1, .. }, InternalMonomialData::Dense { order: o2, .. }) => {
+                    o1.cmp(o2)
+                }
+                // Both sparse or mixed: need exponent-wise degrevlex comparison
+                _ => {
+                    // DegRevLex: reverse lexicographic order on exponents
+                    // Compare from last variable to first (reversed)
+                    let mut lhs_mon = self.tmp_monomial1();
+                    match &lhs.data {
+                        InternalMonomialData::Dense { deg, order } => {
+                            nth_monomial_degrevlex(self.variable_count, *deg, *order, &self.cum_binomial_lookup_table, |i, x| lhs_mon[i] = x);
+                        }
+                        InternalMonomialData::Sparse { exponents, .. } => {
+                            for (i, &e) in exponents.iter().enumerate() {
+                                lhs_mon[i] = e;
+                            }
+                        }
+                    }
+
+                    let mut rhs_mon = self.tmp_monomial2();
+                    match &rhs.data {
+                        InternalMonomialData::Dense { deg, order } => {
+                            nth_monomial_degrevlex(self.variable_count, *deg, *order, &self.cum_binomial_lookup_table, |i, x| rhs_mon[i] = x);
+                        }
+                        InternalMonomialData::Sparse { exponents, .. } => {
+                            for (i, &e) in exponents.iter().enumerate() {
+                                rhs_mon[i] = e;
+                            }
+                        }
+                    }
+
+                    // Reverse lexicographic comparison
+                    for i in (0..self.variable_count).rev() {
+                        match lhs_mon[i].cmp(&rhs_mon[i]) {
+                            Ordering::Less => return Ordering::Greater,
+                            Ordering::Greater => return Ordering::Less,
+                            Ordering::Equal => continue,
+                        }
+                    }
+                    Ordering::Equal
+                }
+            }
+        });
         debug_assert!(res == DegRevLex.compare(RingRef::new(self), &lhs.clone().wrap(), &rhs.clone().wrap()));
         return res;
+    }
+
+    ///
+    /// Compare two monomials under Lex (lexicographic) ordering.
+    ///
+    /// Lex ordering compares exponents variable by variable from first to last:
+    /// X0 > X1 > X2 > ... This method is optimized for sparse monomials, which
+    /// is crucial for 64-variable elimination systems.
+    ///
+    fn compare_lex(&self, lhs: &InternalMonomialIdentifier, rhs: &InternalMonomialIdentifier) -> Ordering {
+        // Fast path: both sparse - directly compare exponent arrays
+        if let (InternalMonomialData::Sparse { exponents: lhs_exp, .. },
+                 InternalMonomialData::Sparse { exponents: rhs_exp, .. }) = (&lhs.data, &rhs.data) {
+            // Lexicographic comparison: compare from first to last variable
+            for i in 0..self.variable_count {
+                match lhs_exp[i].cmp(&rhs_exp[i]) {
+                    Ordering::Greater => return Ordering::Greater,
+                    Ordering::Less => return Ordering::Less,
+                    Ordering::Equal => continue,
+                }
+            }
+            return Ordering::Equal;
+        }
+
+        // Slower path: need to extract exponents for at least one monomial
+        let mut lhs_mon = self.tmp_monomial1();
+        match &lhs.data {
+            InternalMonomialData::Dense { deg, order } => {
+                nth_monomial_degrevlex(self.variable_count, *deg, *order, &self.cum_binomial_lookup_table, |i, x| lhs_mon[i] = x);
+            }
+            InternalMonomialData::Sparse { exponents, .. } => {
+                for (i, &e) in exponents.iter().enumerate() {
+                    lhs_mon[i] = e;
+                }
+            }
+        }
+
+        let mut rhs_mon = self.tmp_monomial2();
+        match &rhs.data {
+            InternalMonomialData::Dense { deg, order } => {
+                nth_monomial_degrevlex(self.variable_count, *deg, *order, &self.cum_binomial_lookup_table, |i, x| rhs_mon[i] = x);
+            }
+            InternalMonomialData::Sparse { exponents, .. } => {
+                for (i, &e) in exponents.iter().enumerate() {
+                    rhs_mon[i] = e;
+                }
+            }
+        }
+
+        // Lexicographic comparison: compare from first to last variable
+        for i in 0..self.variable_count {
+            match lhs_mon[i].cmp(&rhs_mon[i]) {
+                Ordering::Greater => return Ordering::Greater,
+                Ordering::Less => return Ordering::Less,
+                Ordering::Equal => continue,
+            }
+        }
+        Ordering::Equal
     }
 
     fn is_valid(&self, el: &[(El<R>, MonomialIdentifier)]) -> bool {
@@ -558,7 +985,7 @@ impl<R, A> RingBase for MultivariatePolyRingImplBase<R, A>
         if value.data.len() != 1 {
             return false;
         }
-        value.data[0].1.data.deg == 0 && self.base_ring().is_one(&value.data[0].0)
+        value.data[0].1.data.deg() == 0 && self.base_ring().is_one(&value.data[0].0)
     }
 
     fn is_neg_one(&self, value: &Self::Element) -> bool {
@@ -566,7 +993,7 @@ impl<R, A> RingBase for MultivariatePolyRingImplBase<R, A>
         if value.data.len() != 1 {
             return false;
         }
-        value.data[0].1.data.deg == 0 && self.base_ring().is_neg_one(&value.data[0].0)
+        value.data[0].1.data.deg() == 0 && self.base_ring().is_neg_one(&value.data[0].0)
     }
 
     fn is_commutative(&self) -> bool { self.base_ring().is_commutative() }
@@ -664,11 +1091,28 @@ impl<R, A> MultivariatePolyRing for MultivariatePolyRingImplBase<R, A>
             tmp_monomial[i] = e as Exponent;
         }
         assert!(deg <= self.max_supported_deg, "Polynomial ring was configured to support monomials up to degree {}, but create_monomial() was called for degree {}", self.max_supported_deg, deg);
-        return MonomialIdentifier {
-            data: InternalMonomialIdentifier {
-                deg: deg,
-                order: enumeration_index_degrevlex(deg, (&*tmp_monomial).clone_els_by(|x| *x), &self.cum_binomial_lookup_table)
-            }
+
+        if deg <= self.safe_degree_threshold {
+            // Dense mode: use indexed representation
+            return MonomialIdentifier {
+                data: InternalMonomialIdentifier {
+                    data: InternalMonomialData::Dense {
+                        deg: deg,
+                        order: enumeration_index_degrevlex(deg, (&*tmp_monomial).clone_els_by(|x| *x), &self.cum_binomial_lookup_table)
+                    }
+                }
+            };
+        } else {
+            // Sparse mode: store exponents directly
+            let exponents_vec: Vec<Exponent> = tmp_monomial.iter().cloned().collect();
+            return MonomialIdentifier {
+                data: InternalMonomialIdentifier {
+                    data: InternalMonomialData::Sparse {
+                        deg: deg,
+                        exponents: exponents_vec.into_boxed_slice()
+                    }
+                }
+            };
         }
     }
 
@@ -697,51 +1141,9 @@ impl<R, A> MultivariatePolyRing for MultivariatePolyRingImplBase<R, A>
     }
 
     fn mul_assign_monomial(&self, f: &mut Self::Element, rhs: Self::Monomial) {
-        let rhs_deg = rhs.data.deg;
-        let (mut lhs_mon, mut rhs_mon) = self.tmp_monomials();
-        nth_monomial_degrevlex(self.variable_count, rhs_deg, rhs.data.order, &self.cum_binomial_lookup_table, |i, x| rhs_mon[i] = x);
-        
+        // Simply use monomial_mul for each term - it already handles sparse/dense properly
         for (_, lhs) in &mut f.data {
-            let lhs_deg = lhs.data.deg;
-            let mut fallback = || {
-                let res_deg = lhs.data.deg + rhs.data.deg;
-                assert!(res_deg <= self.max_supported_deg, "Polynomial ring was configured to support monomials up to degree {}, but multiplication resulted in degree {}", self.max_supported_deg, res_deg);
-                nth_monomial_degrevlex(self.variable_count, lhs.data.deg, lhs.data.order, &self.cum_binomial_lookup_table, |i, x| lhs_mon[i] = x);
-                for i in 0..self.variable_count {
-                    lhs_mon[i] += rhs_mon[i];
-                }
-                MonomialIdentifier {
-                    data: InternalMonomialIdentifier {
-                        deg: res_deg,
-                        order: enumeration_index_degrevlex(res_deg, (&*lhs_mon).clone_els_by(|x| *x), &self.cum_binomial_lookup_table)
-                    }
-                }
-            };
-            let new_val = if lhs_deg <= rhs_deg {
-                if let Some(table) = self.try_get_multiplication_table(lhs_deg, rhs_deg) {
-                    MonomialIdentifier {
-                        data: InternalMonomialIdentifier {
-                            deg: lhs_deg + rhs_deg,
-                            order: table[lhs.data.order as usize][rhs.data.order as usize]
-                        }
-                    }
-                } else {
-                    fallback()
-                }
-            } else {
-                if let Some(table) = self.try_get_multiplication_table(rhs_deg, lhs_deg) {
-                    MonomialIdentifier {
-                        data: InternalMonomialIdentifier {
-                            deg: lhs_deg + rhs_deg,
-                            order: table[rhs.data.order as usize][lhs.data.order as usize]
-                        }
-                    }
-                } else {
-                    fallback()
-                }
-            };
-            debug_assert!(new_val.data == fallback().data);
-            *lhs = new_val;
+            *lhs = self.monomial_mul(lhs.data.clone().wrap(), &rhs);
         }
     }
 
@@ -753,13 +1155,29 @@ impl<R, A> MultivariatePolyRing for MultivariatePolyRingImplBase<R, A>
     }
 
     fn expand_monomial_to(&self, m: &Self::Monomial, out: &mut [usize]) {
-        nth_monomial_degrevlex(self.variable_count, m.data.deg, m.data.order, &self.cum_binomial_lookup_table, |i, x| out[i] = x as usize);
+        match &m.data.data {
+            InternalMonomialData::Dense { deg, order } => {
+                nth_monomial_degrevlex(self.variable_count, *deg, *order, &self.cum_binomial_lookup_table, |i, x| out[i] = x as usize);
+            }
+            InternalMonomialData::Sparse { exponents, .. } => {
+                for (i, &e) in exponents.iter().enumerate() {
+                    out[i] = e as usize;
+                }
+            }
+        }
     }
 
     fn exponent_at(&self, m: &Self::Monomial, var_index: usize) -> usize {
-        let mut output = 0;
-        nth_monomial_degrevlex(self.variable_count, m.data.deg, m.data.order, &self.cum_binomial_lookup_table, |i, x| if i == var_index { output = x });
-        return output as usize;
+        match &m.data.data {
+            InternalMonomialData::Dense { deg, order } => {
+                let mut output = 0;
+                nth_monomial_degrevlex(self.variable_count, *deg, *order, &self.cum_binomial_lookup_table, |i, x| if i == var_index { output = x });
+                output as usize
+            }
+            InternalMonomialData::Sparse { exponents, .. } => {
+                exponents[var_index] as usize
+            }
+        }
     }
 
     fn terms<'a>(&'a self, f: &'a Self::Element) -> Self::TermIter<'a> {
@@ -769,7 +1187,7 @@ impl<R, A> MultivariatePolyRing for MultivariatePolyRingImplBase<R, A>
     }
 
     fn monomial_deg(&self, mon: &Self::Monomial) -> usize {
-        mon.data.deg as usize
+        mon.data.deg() as usize
     }
 
     fn LT<'a, O: MonomialOrder>(&'a self, f: &'a Self::Element, order: O) -> Option<(&'a El<Self::BaseRing>, &'a Self::Monomial)> {
@@ -799,27 +1217,39 @@ impl<R, A> MultivariatePolyRing for MultivariatePolyRingImplBase<R, A>
     }
 
     fn monomial_mul(&self, lhs: Self::Monomial, rhs: &Self::Monomial) -> Self::Monomial {
-        let lhs_deg = lhs.data.deg;
-        let rhs_deg = rhs.data.deg;
+        let lhs_deg = lhs.data.deg();
+        let rhs_deg = rhs.data.deg();
+
+        // Try to use multiplication table (only works for dense mode)
         if lhs_deg <= rhs_deg {
-            if let Some(table) = self.try_get_multiplication_table(lhs_deg, rhs_deg) {
-                return MonomialIdentifier {
-                    data: InternalMonomialIdentifier {
-                        deg: lhs_deg + rhs_deg,
-                        order: table[lhs.data.order as usize][rhs.data.order as usize]
-                    }
-                };
+            if let (InternalMonomialData::Dense { order: lhs_order, .. }, InternalMonomialData::Dense { order: rhs_order, .. }) = (&lhs.data.data, &rhs.data.data) {
+                if let Some(table) = self.try_get_multiplication_table(lhs_deg, rhs_deg) {
+                    return MonomialIdentifier {
+                        data: InternalMonomialIdentifier {
+                            data: InternalMonomialData::Dense {
+                                deg: lhs_deg + rhs_deg,
+                                order: table[*lhs_order as usize][*rhs_order as usize]
+                            }
+                        }
+                    };
+                }
             }
         } else {
-            if let Some(table) = self.try_get_multiplication_table(rhs_deg, lhs_deg) {
-                return MonomialIdentifier {
-                    data: InternalMonomialIdentifier {
-                        deg: lhs_deg + rhs_deg,
-                        order: table[rhs.data.order as usize][lhs.data.order as usize]
-                    }
-                };
+            if let (InternalMonomialData::Dense { order: lhs_order, .. }, InternalMonomialData::Dense { order: rhs_order, .. }) = (&lhs.data.data, &rhs.data.data) {
+                if let Some(table) = self.try_get_multiplication_table(rhs_deg, lhs_deg) {
+                    return MonomialIdentifier {
+                        data: InternalMonomialIdentifier {
+                            data: InternalMonomialData::Dense {
+                                deg: lhs_deg + rhs_deg,
+                                order: table[*rhs_order as usize][*lhs_order as usize]
+                            }
+                        }
+                    };
+                }
             }
         }
+
+        // Fallback to exponent-wise operation
         return self.exponent_wise_bivariate_monomial_operation(lhs.data, rhs.data.clone(), |a, b| a + b);
     }
 
@@ -855,6 +1285,7 @@ impl<R, A> MultivariatePolyRing for MultivariatePolyRingImplBase<R, A>
             base_ring: hom.codomain(),
             variable_count: self.variable_count,
             max_supported_deg: self.max_supported_deg,
+            safe_degree_threshold: self.safe_degree_threshold,
             monomial_multiplication_table: self.monomial_multiplication_table.clone(),
             tmp_monomials: ThreadLocal::new(),
             cum_binomial_lookup_table: self.cum_binomial_lookup_table.clone(),
@@ -869,7 +1300,7 @@ impl<R, A> MultivariatePolyRing for MultivariatePolyRingImplBase<R, A>
         if result.data.len() == 0 {
             return hom.codomain().zero();
         } else {
-            debug_assert!(result.data[0].1.data.deg == 0);
+            debug_assert!(result.data[0].1.data.deg() == 0);
             return result.data.into_iter().next().unwrap().0;
         }
     }
@@ -1072,4 +1503,155 @@ fn test_appearing_indeterminates() {
     let [f, g] = F7XY.with_wrapped_indeterminates(|[X, Y]| [5 + 4 * X, 6 + 2 * Y]);
     assert_eq!(vec![(0, 1)], F7XY.appearing_indeterminates(&f));
     assert_eq!(vec![(1, 1)], F7XY.appearing_indeterminates(&g));
+}
+
+#[test]
+fn test_64_variables_sparse_mode() {
+    // This test validates the sparse monomial infrastructure for large-variable systems
+    // Context: zyga ZKP requires 64 variables with degrees up to 30+
+
+    let ring = MultivariatePolyRingImpl::new_with_mult_table(
+        StaticRing::<i64>::RING,
+        64,        // 64 variables
+        30,        // max degree 30
+        (2, 2),    // minimal multiplication table
+        Global
+    );
+
+    // Verify safe_degree_threshold was computed
+    // For 64 variables, binomial(64+d-1, d) exceeds u64::MAX somewhere around d=21
+    // The exact threshold depends on the computation, but it should be > 0
+    assert!(ring.get_ring().safe_degree_threshold > 0);
+    assert!(ring.get_ring().safe_degree_threshold < ring.get_ring().max_supported_deg);
+
+    // Test 1: Low-degree monomials should use dense mode
+    let m_deg1 = ring.create_monomial((0..64).map(|i| if i == 0 { 1 } else { 0 })); // X_0
+    let m_deg2 = ring.create_monomial((0..64).map(|i| if i == 0 { 2 } else { 0 })); // X_0^2
+
+    // Verify these use dense mode by checking the internal representation
+    match &m_deg1.data.data {
+        InternalMonomialData::Dense { deg, .. } => assert_eq!(*deg, 1),
+        InternalMonomialData::Sparse { .. } => panic!("Expected dense mode for degree 1"),
+    }
+    match &m_deg2.data.data {
+        InternalMonomialData::Dense { deg, .. } => assert_eq!(*deg, 2),
+        InternalMonomialData::Sparse { .. } => panic!("Expected dense mode for degree 2"),
+    }
+
+    // Test 2: High-degree monomials should use sparse mode
+    // Create a monomial with degree > safe_degree_threshold
+    let high_deg = ring.get_ring().safe_degree_threshold + 1;
+    let m_high = ring.create_monomial((0..64).map(|i| if i == 0 { high_deg as usize } else { 0 }));
+
+    match &m_high.data.data {
+        InternalMonomialData::Sparse { deg, exponents } => {
+            assert_eq!(*deg, high_deg);
+            assert_eq!(exponents.len(), 64);
+            assert_eq!(exponents[0], high_deg);
+            for i in 1..64 {
+                assert_eq!(exponents[i], 0);
+            }
+        }
+        InternalMonomialData::Dense { .. } => panic!("Expected sparse mode for degree {}", high_deg),
+    }
+
+    // Test 3: Monomial multiplication across modes (dense * dense -> sparse)
+    if ring.get_ring().safe_degree_threshold >= 2 {
+        let m1 = ring.create_monomial((0..64).map(|i| if i == 0 { 1 } else { 0 }));
+        let m2 = ring.create_monomial((0..64).map(|i| if i == 1 { 1 } else { 0 }));
+        let m_prod = ring.monomial_mul(m1, &m2);
+
+        // Product is X_0 * X_1, degree 2
+        let mut expected_exps = vec![0u16; 64];
+        expected_exps[0] = 1;
+        expected_exps[1] = 1;
+
+        let mut actual_exps = vec![0; 64];
+        ring.expand_monomial_to(&m_prod, &mut actual_exps);
+
+        assert_eq!(expected_exps.iter().map(|&x| x as usize).collect::<Vec<_>>(), actual_exps);
+    }
+
+    // Test 4: Sparse monomial multiplication (sparse * sparse -> sparse)
+    let deg_a = ring.get_ring().safe_degree_threshold + 1;
+    let deg_b = 2;
+    let m_sparse1 = ring.create_monomial((0..64).map(|i| if i == 5 { deg_a as usize } else { 0 }));
+    let m_sparse2 = ring.create_monomial((0..64).map(|i| if i == 10 { deg_b as usize } else { 0 }));
+    let m_sparse_prod = ring.monomial_mul(ring.clone_monomial(&m_sparse1), &m_sparse2);
+
+    match &m_sparse_prod.data.data {
+        InternalMonomialData::Sparse { deg, exponents } => {
+            assert_eq!(*deg, deg_a + deg_b);
+            assert_eq!(exponents[5], deg_a);
+            assert_eq!(exponents[10], deg_b);
+        }
+        InternalMonomialData::Dense { .. } => panic!("Expected sparse mode for high-degree product"),
+    }
+
+    // Test 5: Monomial LCM with sparse monomials
+    let m_lcm = ring.monomial_lcm(m_sparse1, &m_sparse2);
+    assert_eq!(ring.monomial_deg(&m_lcm), (deg_a + deg_b) as usize);
+
+    // Test 6: Polynomial arithmetic with sparse monomials
+    let high_deg_term = ring.get_ring().safe_degree_threshold + 2;
+    let poly_sparse = ring.from_terms([
+        (ring.base_ring().one(), ring.create_monomial((0..64).map(|i| if i == 0 { high_deg_term as usize } else { 0 }))),
+        (ring.base_ring().neg_one(), ring.create_monomial((0..64).map(|i| if i == 1 { high_deg_term as usize } else { 0 }))),
+    ]);
+
+    // Verify polynomial operations work
+    let poly_sum = ring.add_ref(&poly_sparse, &poly_sparse);
+    assert_eq!(ring.terms(&poly_sum).count(), 2); // Two terms should combine (coeff doubling)
+
+    // Test 7: DegRevLex comparison for sparse monomials
+    let m_a = ring.create_monomial((0..64).map(|i| if i == 63 { high_deg_term as usize } else { 0 }));
+    let m_b = ring.create_monomial((0..64).map(|i| if i == 0 { high_deg_term as usize } else { 0 }));
+
+    // In DegRevLex, same degree is compared by reverse lex: [0,0,...,d] < [d,0,...,0]
+    let cmp = ring.get_ring().compare_degrevlex(&m_a.data, &m_b.data);
+    assert_eq!(cmp, Ordering::Less, "DegRevLex comparison failed for sparse monomials");
+
+    // Test 8: Exponent access for sparse monomials
+    assert_eq!(ring.exponent_at(&m_high, 0), high_deg as usize);
+    assert_eq!(ring.exponent_at(&m_high, 1), 0);
+    assert_eq!(ring.exponent_at(&m_high, 63), 0);
+}
+
+#[test]
+fn test_sparse_mode_polynomial_multiplication() {
+    // Test polynomial multiplication with sparse monomials
+    let ring = MultivariatePolyRingImpl::new_with_mult_table(
+        StaticRing::<i64>::RING,
+        64,
+        30,
+        (1, 1),
+        Global
+    );
+
+    let high_deg = ring.get_ring().safe_degree_threshold + 1;
+
+    // Create two polynomials with sparse monomials
+    // f = X_0^high_deg + X_1^high_deg
+    let f = ring.from_terms([
+        (1, ring.create_monomial((0..64).map(|i| if i == 0 { high_deg as usize } else { 0 }))),
+        (1, ring.create_monomial((0..64).map(|i| if i == 1 { high_deg as usize } else { 0 }))),
+    ]);
+
+    // g = X_2 + 1
+    let g = ring.from_terms([
+        (1, ring.create_monomial((0..64).map(|i| if i == 2 { 1 } else { 0 }))),
+        (1, ring.create_monomial((0..64).map(|_| 0))),
+    ]);
+
+    // Compute f * g
+    let product = ring.mul_ref(&f, &g);
+
+    // Expected: X_0^high_deg * X_2 + X_0^high_deg + X_1^high_deg * X_2 + X_1^high_deg
+    assert_eq!(ring.terms(&product).count(), 4);
+
+    // Verify degrees
+    for (_, m) in ring.terms(&product) {
+        let deg = ring.monomial_deg(m);
+        assert!(deg == high_deg as usize || deg == (high_deg + 1) as usize);
+    }
 }

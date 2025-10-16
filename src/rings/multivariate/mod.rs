@@ -611,7 +611,7 @@ impl GradedMonomialOrder for DegRevLex {}
 
 ///
 /// Lexicographic ordering of monomials.
-/// 
+///
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Lex;
 
@@ -633,6 +633,101 @@ impl MonomialOrder for Lex {
             }
         }
         return Ordering::Equal;
+    }
+}
+
+///
+/// Block lexicographic ordering for variable elimination.
+///
+/// This ordering splits variables into two blocks: the elimination block (variables 0..split_at)
+/// and the remaining block (variables split_at..n). Monomials are compared lexicographically
+/// first on the elimination block, and only if that comparison is equal, the remaining block
+/// is compared lexicographically.
+///
+/// This ordering is crucial for computing elimination ideals via Gröbner bases. If you compute
+/// a Gröbner basis with BlockLex where the elimination block contains variables z1,...,zk,
+/// then the polynomials in the basis that only involve the remaining variables form a Gröbner
+/// basis for the elimination ideal (I ∩ k[remaining variables]).
+///
+/// # Example
+/// For a system in variables [z0, z1, z2, y0, y1] with split_at=3:
+/// - z0^2*y0 > z0*z1*y1 (because z0^2*y0 has z0^2 vs z0*z1, and 2 > 1 in first position)
+/// - z0*z1 > y0^10 (because z0*z1 has nonzero elimination vars, y0^10 doesn't)
+/// - y0^2 > y0*y1 (both have zero elimination vars, compare remaining: y0^2 vs y0*y1)
+///
+/// # Usage in 64-variable elimination
+/// ```ignore
+/// use feanor_math::rings::multivariate::*;
+/// use feanor_math::rings::multivariate::multivariate_impl::*;
+/// use feanor_math::primitive_int::*;
+///
+/// let ring = MultivariatePolyRingImpl::new(StaticRing::<i64>::RING, 65);
+/// // Eliminate first 64 variables, keep last variable
+/// let order = BlockLex::new(64);
+/// // Compute Gröbner basis with this order
+/// // Polynomials involving only variable 64 will form the elimination ideal GB
+/// ```
+///
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlockLex {
+    /// Index where the elimination block ends (exclusive).
+    /// Variables 0..split_at form the elimination block.
+    /// Variables split_at..n form the remaining block.
+    pub split_at: usize,
+}
+
+impl BlockLex {
+    /// Creates a new block lexicographic ordering with the given split point.
+    ///
+    /// # Arguments
+    /// - `split_at`: The index where the elimination block ends (exclusive).
+    ///   Variables 0..split_at will be prioritized for elimination.
+    ///
+    pub const fn new(split_at: usize) -> Self {
+        BlockLex { split_at }
+    }
+}
+
+impl MonomialOrder for BlockLex {
+    fn as_any(&self) -> Option<&dyn Any> {
+        None // Not zero-sized, so we can't use the default is_same implementation
+    }
+
+    fn compare<P>(&self, ring: P, lhs: &PolyMonomial<P>, rhs: &PolyMonomial<P>) -> Ordering
+        where P: RingStore,
+            P::Type: MultivariatePolyRing
+    {
+        // First compare the elimination block (variables 0..split_at) lexicographically
+        for i in 0..self.split_at.min(ring.indeterminate_count()) {
+            match ring.exponent_at(lhs, i).cmp(&ring.exponent_at(rhs, i)) {
+                Ordering::Less => { return Ordering::Less; },
+                Ordering::Greater => { return Ordering::Greater; },
+                Ordering::Equal => {}
+            }
+        }
+
+        // If elimination block is equal, compare remaining block lexicographically
+        for i in self.split_at..ring.indeterminate_count() {
+            match ring.exponent_at(lhs, i).cmp(&ring.exponent_at(rhs, i)) {
+                Ordering::Less => { return Ordering::Less; },
+                Ordering::Greater => { return Ordering::Greater; },
+                Ordering::Equal => {}
+            }
+        }
+
+        return Ordering::Equal;
+    }
+
+    fn is_same<O>(&self, rhs: &O) -> bool
+        where O: MonomialOrder
+    {
+        // Since BlockLex is not zero-sized, we need custom comparison
+        if let Some(rhs_any) = rhs.as_any() {
+            if let Some(rhs_block_lex) = rhs_any.downcast_ref::<BlockLex>() {
+                return self.split_at == rhs_block_lex.split_at;
+            }
+        }
+        false
     }
 }
 
